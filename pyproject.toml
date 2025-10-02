@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pco" # Choose a name for your overall project/package
+version = "0.5" # Or your preferred versioning
+# Add description, authors, etc. as needed
+
+[tool.setuptools.packages.find]
+where = ["src"]
