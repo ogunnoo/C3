@@ -1,11 +1,15 @@
 from pathlib import Path
 import re
-from typing import Iterable
+from typing import Iterable, Optional
+import datetime as dt
 
 from playwright.sync_api import Page, sync_playwright, expect, TimeoutError
-
+import pypco
+import os
 from .models import GroupRow
+from dotenv import load_dotenv
 
+load_dotenv()
 AUTH_FILE = Path("playwright/.auth/planningcenter.json")
 ARTIFACTS_DIR = Path("artifacts")
 
@@ -127,26 +131,79 @@ def debug_after_add_person(page: Page) -> None:
     (ARTIFACTS_DIR / "add_person_debug.html").write_text(page.content(), encoding="utf-8")
 
 
-def add_leader(page: Page, leader_name: str) -> None:
-    add_person_button = page.get_by_role("button", name="Add a person")
-    expect(add_person_button).to_be_visible(timeout=15000)
+def parse_leader_names(raw_value: str | None) -> list[str]:
+    if not raw_value:
+        return []
+    return [name.strip() for name in re.split(r"[;|,]", raw_value) if name.strip()]
+
+
+def wait_for_add_person_modal_to_close(page: Page) -> None:
+    modal = page.locator(".modal-layer")
+    if modal.count() > 0:
+        try:
+            modal.last.wait_for(state="hidden", timeout=10000)
+        except Exception:
+            try:
+                modal.last.wait_for(state="detached", timeout=10000)
+            except Exception:
+                pass
+
+def select_role_if_needed(page: Page, desired_role: str = "Add leader") -> None:
+    def get_role_picker():
+        return page.locator('[id^="select-"] > .tapestry-react-reset').first
+
+    role_picker = get_role_picker()
+    expect(role_picker).to_be_visible(timeout=10000)
+
+    current_text = (role_picker.text_content() or "").strip()
+    print(f"Current role picker text: {current_text}")
+
+    if desired_role.lower() in current_text.lower():
+        return
+
+    # Re-acquire just before clicking in case React re-rendered it
+    role_picker = get_role_picker()
+    expect(role_picker).to_be_visible(timeout=10000)
+    expect(role_picker).to_contain_text("Add", timeout=5000)
+
+    for attempt in range(3):
+        try:
+            role_picker = get_role_picker()
+            role_picker.click()
+            break
+        except Exception:
+            if attempt == 2:
+                raise
+            page.wait_for_timeout(500)
+
+    desired_option = page.get_by_text(desired_role, exact=True)
+    expect(desired_option.first).to_be_visible(timeout=5000)
+    desired_option.first.click()
+
+def add_person_with_role(page: Page, person_name: str, desired_role: str = "Add leader") -> None:
+    wait_for_add_person_modal_to_close(page)
+
+    add_person_button = page.get_by_role(
+        "button",
+        name=re.compile(r"Add a person|Add member", re.IGNORECASE),
+    ).first
+    expect(add_person_button).to_be_visible(timeout=10000)
     add_person_button.click()
 
+    # wait for modal content to stabilize
     role_picker = page.locator('[id^="select-"] > .tapestry-react-reset').first
     expect(role_picker).to_be_visible(timeout=10000)
-    role_picker.click()
+    page.wait_for_timeout(500)
 
-    leader_option = page.get_by_text("Add leader", exact=True)
-    expect(leader_option).to_be_visible(timeout=10000)
-    leader_option.click()
+    select_role_if_needed(page, desired_role)
 
     search_box = page.get_by_role("textbox", name="Search for someone to add...")
     expect(search_box).to_be_visible(timeout=10000)
-    search_box.fill(leader_name)
+    search_box.fill(person_name)
 
     person_result = page.get_by_role(
         "button",
-        name=re.compile(re.escape(leader_name), re.IGNORECASE),
+        name=re.compile(re.escape(person_name), re.IGNORECASE),
     ).first
     expect(person_result).to_be_visible(timeout=10000)
     person_result.click()
@@ -158,7 +215,16 @@ def add_leader(page: Page, leader_name: str) -> None:
     expect(confirm_button).to_be_visible(timeout=10000)
     confirm_button.click()
 
-    expect(add_person_button).to_be_visible(timeout=15000)
+    wait_for_add_person_modal_to_close(page)
+
+
+def add_leaders(page: Page, leader_names: list[str]) -> None:
+    for leader_name in leader_names:
+        try:
+            add_person_with_role(page, leader_name, "Add leader")
+            print(f"Added leader: {leader_name}")
+        except Exception as exc:
+            print(f"Failed to add leader '{leader_name}': {exc}")
 
 
 def open_settings(page: Page) -> None:
@@ -519,11 +585,115 @@ def add_meeting_schedule(page: Page, row: GroupRow) -> None:
     save_button.click()
 
 
+
+def get_group_id(pco: pypco.PCO, group_name: str) -> Optional[int]:
+    """Resolve group ID by exact name search."""
+    data = pco.get(f"/groups/v2/groups?where[name]={group_name}")
+    if data.get("data"):
+        return int(data["data"][0]["id"])
+    return None
+
+
+def build_pco_client() -> pypco.PCO:
+    app_id = os.getenv("PCO_APP_ID")
+    app_secret = os.getenv("PCO_SECRET")
+    if not app_id or not app_secret:
+        raise RuntimeError("Missing PCO_APP_ID or PCO_SECRET environment variables.")
+    return pypco.PCO(app_id, app_secret)
+
+
+def normalize_name(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip()).lower()
+
+
+def person_name_variants(person_data: dict) -> set[str]:
+    attrs = person_data.get("attributes", {})
+    first = (attrs.get("first_name") or "").strip()
+    last = (attrs.get("last_name") or "").strip()
+    full = (attrs.get("name") or f"{first} {last}").strip()
+
+    variants = {normalize_name(full)}
+    if first or last:
+        variants.add(normalize_name(f"{first} {last}"))
+        variants.add(normalize_name(f"{last}, {first}"))
+    return {v for v in variants if v}
+
+
+def update_group_membership_role(
+    pco: pypco.PCO,
+    group_id: str,
+    leader_names: list[str],
+    target_role: str = "leader",
+) -> None:
+    desired_names = {normalize_name(name): name for name in leader_names if name.strip()}
+    if not desired_names:
+        return
+
+    memberships_path = f"/groups/v2/groups/{group_id}/memberships?include=person"
+    matched = set()
+
+    for membership in pco.iterate(memberships_path):
+        data = membership.get("data", {})
+        membership_id = data.get("id")
+        included = membership.get("included", []) or []
+
+        person = next((x for x in included if x.get("type") == "Person"), None)
+        if not person:
+            continue
+
+        variants = person_name_variants(person)
+        matched_input = next((wanted for wanted in desired_names if wanted in variants), None)
+        if not matched_input or not membership_id:
+            continue
+
+        payload = {
+            "data": {
+                "type": "Membership",
+                "id": str(membership_id),
+                "attributes": {
+                    "role": target_role
+                }
+            }
+        }
+
+        try:
+            pco.patch(
+                f"/groups/v2/groups/{group_id}/memberships/{membership_id}",
+                payload,
+            )
+            print(
+                f"Updated membership role for '{desired_names[matched_input]}' "
+                f"to '{target_role}'"
+            )
+            matched.add(matched_input)
+        except Exception as exc:
+            print(
+                f"Failed to update membership role for "
+                f"'{desired_names[matched_input]}': {exc}"
+            )
+
+    missing = set(desired_names) - matched
+    for missed in missing:
+        print(f"Could not find membership for leader: {desired_names[missed]}")
+
 def create_group(page: Page, row: GroupRow) -> None:
     create_basic_group(page, row)
 
-    if row.leader_name:
-        add_leader(page, row.leader_name)
+    leader_names = parse_leader_names(row.leader_name)
+    if leader_names:
+        add_leaders(page, leader_names)
+
+        try:
+            pco = build_pco_client()
+            group_id = get_group_id(pco, row.name)
+            update_group_membership_role(
+                pco=pco,
+                group_id=group_id,
+                leader_names=leader_names,
+                target_role="leader",
+            )
+        except Exception as exc:
+            print(f"Skipping PyPCO role updates for {row.name}: {exc}")
 
     open_settings(page)
     set_chat_to_only_leaders(page)

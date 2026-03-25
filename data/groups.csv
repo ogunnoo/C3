@@ -1,2 +1,2 @@
 name,group_type,description,leader_name,campus,tag_1,tag_2,location_name,street_address,admin_alert_days,meeting_frequency,meeting_day,start_hour,start_minute,start_ampm,end_hour,end_minute,end_ampm
-Z-Connect-Group,Connect Groups,This is a test group,"Kristina D'Sa",Downtown,Sermon Discussion,Summer 2026,Bloor and Christie,"30 Samuel Wood Way, Etobicoke",20,Every other week,Friday,7,00,AM,8,00,AM
+Z-Connect-Group,Connect Groups,This is a test group,"Kristina D'Sa; Francesca Pereira",Downtown,Sermon Discussion,Summer 2026,Bloor and Christie,"30 Samuel Wood Way, Etobicoke",20,Every other week,Friday,7,00,AM,8,00,AM
